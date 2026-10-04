@@ -49,7 +49,7 @@ Error Handling:
     },
     async ({ response_format = "markdown" }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await getDevices(gatewayManager.gateway!);
 
         if (!result.success) {
@@ -118,7 +118,7 @@ Error Handling:
     },
     async ({ dids, response_format = "markdown" }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await getDevice(gatewayManager.gateway!, dids);
 
         if (!result.success) {
@@ -193,7 +193,7 @@ Note: 需要逐条拉取规则，规则较多时耗时数秒。`,
     },
     async ({ dids, query, response_format = "markdown" }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await findDeviceUsage(gatewayManager.gateway!, { dids, query });
 
         if (!result.success) {

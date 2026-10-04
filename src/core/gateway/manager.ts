@@ -15,13 +15,19 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { GatewayClient } from './client';
+import { getCredentialStore, type CredentialStore, type GatewayCredential } from './credential';
 
 export interface GatewayManager {
     gateway: GatewayClient | null;
     isConnected(): boolean;
+    credentialSaved(): boolean;
+    credentialBackend(): 'keychain' | 'file' | null;
+    forgetCredential(): void;
+    markCredentialInvalid(): void;
     connect(passcode: string, gatewayUrl?: string): Promise<void>;
     disconnect(): Promise<void>;
-    ensureConnected(): void;
+    forget(): Promise<void>;
+    ensureConnected(): Promise<void>;
 }
 
 interface CachedCredentials {
@@ -30,39 +36,35 @@ interface CachedCredentials {
     savedAt: number;
 }
 
-const CRED_FILE = process.env.OH_MY_SAGE_CRED_FILE
+const LEGACY_CRED_FILE = process.env.OH_MY_SAGE_CRED_FILE
     || path.join(os.homedir(), '.oh-my-sage', 'credentials.json');
 
-function loadCachedCredentials(): CachedCredentials | null {
+/** @deprecated 兼容旧凭据文件：首次迁移到 CredentialStore 后删除 */
+function migrateLegacyCredentials(store: CredentialStore): void {
     try {
-        const parsed = JSON.parse(fs.readFileSync(CRED_FILE, 'utf8')) as CachedCredentials;
-        if (parsed?.gatewayUrl && parsed?.passcode) return parsed;
+        const parsed = JSON.parse(fs.readFileSync(LEGACY_CRED_FILE, 'utf8')) as CachedCredentials;
+        if (parsed?.gatewayUrl && parsed?.passcode) {
+            const current = store.load();
+            if (!current) store.save({ gatewayUrl: parsed.gatewayUrl, passcode: parsed.passcode });
+            try { fs.unlinkSync(LEGACY_CRED_FILE); } catch { /* ignore */ }
+            console.error('[oh-my-sage] 旧凭据已迁移到', store.backend);
+        }
     } catch {
-        // 未认证过或文件损坏：当作无缓存
+        // 无旧文件
     }
-    return null;
-}
-
-function saveCachedCredentials(creds: CachedCredentials): void {
-    try {
-        fs.mkdirSync(path.dirname(CRED_FILE), { recursive: true });
-        fs.writeFileSync(CRED_FILE, JSON.stringify(creds, null, 2), { mode: 0o600 });
-        try { fs.chmodSync(CRED_FILE, 0o600); } catch { /* best effort */ }
-    } catch (e) {
-        console.error('[oh-my-sage] 保存网关凭据失败:', e);
-    }
-}
-
-function clearCachedCredentials(): void {
-    try { fs.unlinkSync(CRED_FILE); } catch { /* already gone */ }
 }
 
 export function createGatewayManager(): GatewayManager {
+    const store = getCredentialStore();
+    migrateLegacyCredentials(store);
+
     let gateway: GatewayClient | null = null;
     let connectChain: Promise<unknown> = Promise.resolve();
-    let autoConnectTimer: ReturnType<typeof setTimeout> | null = null;
     let attemptCount = 0;
     let lastAttemptAt = 0;
+    // 凭据熔断：连续认证失败达到阈值后停止自动重连，等用户重新 mijia_auth
+    let credentialInvalid = false;
+    const MAX_AUTH_FAILURES = 3;
 
     /** 串行化所有连接动作：同一时刻只允许一个握手在跑（防帧错乱） */
     function serialized<T>(task: () => Promise<T>): Promise<T> {
@@ -71,10 +73,16 @@ export function createGatewayManager(): GatewayManager {
         return run;
     }
 
+    function isAuthFailure(e: unknown): boolean {
+        const msg = e instanceof Error ? e.message : String(e);
+        return /JPAKE|passcode|认证|protocol selection/i.test(msg);
+    }
+
     async function autoConnect(reason: string): Promise<boolean> {
         return serialized(async () => {
             if (gateway !== null && gateway.isConnected()) return true;
-            const creds = loadCachedCredentials();
+            if (credentialInvalid) return false;
+            const creds = store.load();
             if (!creds) return false;
 
             // 全局重连预算：指数退避（5s/15s/45s/...），封顶 5 分钟
@@ -85,7 +93,7 @@ export function createGatewayManager(): GatewayManager {
 
             let client: GatewayClient | null = null;
             try {
-                console.error(`[oh-my-sage] auto-connect (${reason}): ${creds.gatewayUrl}`);
+                console.error(`[oh-my-sage] auto-connect (${reason}, ${store.backend}): ${creds.gatewayUrl}`);
                 if (gateway) {
                     try { await gateway.close(); } catch { /* ignore */ }
                     gateway = null;
@@ -107,6 +115,11 @@ export function createGatewayManager(): GatewayManager {
                 // 堆积的半开会话会占满网关会话槽、导致后续认证被拒
                 if (client) { try { await client.close(); } catch { /* ignore */ } }
                 gateway = null;
+                // 认证型失败连续达阈值 → 熔断，防止拿失效码无限撞网关
+                if (isAuthFailure(e) && attemptCount >= MAX_AUTH_FAILURES) {
+                    credentialInvalid = true;
+                    console.error(`[oh-my-sage] 凭据连续 ${attemptCount} 次认证失败，已停止自动重连；请重新 mijia_auth`);
+                }
                 return false;
             }
         });
@@ -122,12 +135,30 @@ export function createGatewayManager(): GatewayManager {
 
         isConnected(): boolean {
             if (gateway !== null && gateway.isConnected()) return true;
-            // 断线自愈：有缓存凭据 → 后台触发一次重连（内部有指数退避预算，
-            // 不会高频打网关；当前调用仍返回 false，工具层提示稍后重试）
-            if (loadCachedCredentials() !== null) {
+            // 断线自愈：有缓存凭据 → 后台触发一次重连（内部有指数退避预算）
+            if (!credentialInvalid && store.load() !== null) {
                 void autoConnect('reconnect');
             }
             return false;
+        },
+
+        credentialSaved(): boolean {
+            return store.load() !== null;
+        },
+
+        credentialBackend(): 'keychain' | 'file' | null {
+            return store.load() !== null ? store.backend : null;
+        },
+
+        forgetCredential(): void {
+            store.clear();
+            credentialInvalid = false;
+            attemptCount = 0;
+            lastAttemptAt = 0;
+        },
+
+        markCredentialInvalid(): void {
+            credentialInvalid = true;
         },
 
         async connect(passcode: string, gatewayUrl?: string): Promise<void> {
@@ -149,8 +180,7 @@ export function createGatewayManager(): GatewayManager {
                 await client.connect(url);
                 await client.authenticate(passcode);
                 gateway = client;
-                // 断线监听：WS 一断（keepalive 判死 / 网关重启 / 网络闪断）立即调度自动重连，
-                // 不再等下一次工具调用才发现。延迟 1s 给 serialized 链留出串行窗口。
+                // 断线监听：WS 一断（keepalive 判死 / 网关重启 / 网络闪断）立即调度自动重连
                 client.onDisconnected(() => {
                     if (gateway === client) {
                         gateway = null;
@@ -159,7 +189,9 @@ export function createGatewayManager(): GatewayManager {
                 });
             });
 
-            saveCachedCredentials({ gatewayUrl: url, passcode, savedAt: Date.now() });
+            // 认证成功才持久化（P0 原则：失败绝不落盘）
+            store.save({ gatewayUrl: url, passcode });
+            credentialInvalid = false;
             attemptCount = 0;
             lastAttemptAt = 0;
         },
@@ -174,22 +206,48 @@ export function createGatewayManager(): GatewayManager {
                     gateway = null;
                 }
             });
-            if (autoConnectTimer !== null) {
-                clearTimeout(autoConnectTimer);
-                autoConnectTimer = null;
-            }
             attemptCount = 0;
             lastAttemptAt = 0;
-            // 显式断开 = 撤销本机保存的登录码，之后需重新 mijia_auth
-            clearCachedCredentials();
+            // disconnect ≠ logout：保留凭据，下次调用自动恢复连接
         },
 
-        ensureConnected(): void {
-            if (!this.isConnected()) {
-                const hasCreds = loadCachedCredentials() !== null;
-                throw new Error(hasCreds
-                    ? '网关连接建立中：正在用已保存的凭据自动重连，请几秒后重试'
-                    : '网关未连接，请先调用 mijia_auth（认证成功后会缓存凭据，之后新会话自动连接）');
+        async forget(): Promise<void> {
+            await serialized(async () => {
+                if (gateway) {
+                    try {
+                        await gateway.close();
+                    } catch {
+                    }
+                    gateway = null;
+                }
+            });
+            attemptCount = 0;
+            lastAttemptAt = 0;
+            store.clear();
+            credentialInvalid = false;
+        },
+
+        async ensureConnected(): Promise<void> {
+            if (gateway !== null && gateway.isConnected()) return;
+
+            const creds = store.load();
+            if (!creds) {
+                throw new Error('尚未保存网关凭据，请先调用 mijia_auth（认证成功后凭据自动保存，之后断线/重启均自动恢复）');
+            }
+            if (credentialInvalid) {
+                throw new Error('保存的网关登录码已失效（连续认证失败），请重新调用 mijia_auth 输入新的登录码');
+            }
+
+            // 触发重连（若退避期内会返回 false），然后短暂轮询等待结果
+            const ok = await autoConnect('ensure');
+            if (!ok) {
+                // 可能还在退避窗口；等待一个短周期再查
+                for (let i = 0; i < 20 && (gateway === null || !gateway.isConnected()); i++) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+            }
+            if (gateway === null || !gateway.isConnected()) {
+                throw new Error('网关连接建立中：正在用已保存的凭据自动重连，请几秒后重试');
             }
         },
     };

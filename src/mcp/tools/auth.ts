@@ -50,7 +50,7 @@ Error Handling:
     async ({ passcode, gateway_url }) => {
       if (gatewayManager.isConnected()) {
         return {
-          content: [{ type: "text", text: JSON.stringify({ success: false, error: "已连接，请先调用 mijia_disconnect" }) }],
+          content: [{ type: "text", text: JSON.stringify({ success: false, error: "已连接。如需换登录码，请先调用 mijia_forget_auth 再重新 mijia_auth" }) }],
           isError: true,
         };
       }
@@ -81,9 +81,43 @@ Error Handling:
     "mijia_disconnect",
     {
       title: "断开网关连接",
-      description: `断开与米家网关的连接。
+      description: `断开与米家网关的 WebSocket 连接（保留已保存的凭据）。
 
-调用后可重新调用 mijia_auth 建立新连接。建议在完成所有操作后调用以释放资源。`,
+断开后任何工具调用会自动用保存的凭据重连，无需重新输入登录码。
+如需彻底注销并删除保存的登录码，请调用 mijia_forget_auth。`,
+      inputSchema: z.object({}),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async () => {
+      try {
+        await gatewayManager.disconnect();
+        return {
+          content: [{ type: "text", text: JSON.stringify({ success: true, message: "已断开（凭据已保留，下次调用自动重连）" }) }],
+          structuredContent: { success: true, connected: false, credentialSaved: gatewayManager.credentialSaved() },
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ success: false, error: String(error) }) }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ==================== mijia_forget_auth ====================
+  server.registerTool(
+    "mijia_forget_auth",
+    {
+      title: "彻底注销（删除保存的登录码）",
+      description: `断开连接并删除本机保存的网关登录码（macOS Keychain / 本地文件）。
+
+之后需要重新调用 mijia_auth 输入新的登录码才能连接。
+与 mijia_disconnect 的区别：disconnect 只断线不删凭据，forget_auth 彻底注销。`,
       inputSchema: z.object({}),
       annotations: {
         readOnlyHint: false,
@@ -94,10 +128,10 @@ Error Handling:
     },
     async () => {
       try {
-        await gatewayManager.disconnect();
+        await gatewayManager.forget();
         return {
-          content: [{ type: "text", text: JSON.stringify({ success: true, message: "已断开" }) }],
-          structuredContent: { success: true, connected: false },
+          content: [{ type: "text", text: JSON.stringify({ success: true, message: "已断开并删除保存的登录码" }) }],
+          structuredContent: { success: true, connected: false, credentialSaved: false },
         };
       } catch (error) {
         return {
@@ -116,7 +150,10 @@ Error Handling:
       description: `检查与米家网关的连接状态。
 
 Returns:
-  - connected: boolean - 是否已连接`,
+  - connected: boolean - 当前是否已连接
+  - credentialSaved: boolean - 本机是否保存了登录凭据
+  - credentialBackend: "keychain" | "file" | null - 凭据存储位置
+  - canAutoReconnect: boolean - 断线后能否自动恢复连接`,
       inputSchema: z.object({}),
       annotations: {
         readOnlyHint: true,
@@ -127,9 +164,10 @@ Returns:
     },
     async () => {
       const connected = gatewayManager.isConnected();
+      const credentialSaved = gatewayManager.credentialSaved();
       return {
-        content: [{ type: "text", text: JSON.stringify({ connected }) }],
-        structuredContent: { connected },
+        content: [{ type: "text", text: JSON.stringify({ connected, credentialSaved, credentialBackend: gatewayManager.credentialBackend(), canAutoReconnect: credentialSaved }) }],
+        structuredContent: { connected, credentialSaved, credentialBackend: gatewayManager.credentialBackend(), canAutoReconnect: credentialSaved },
       };
     }
   );

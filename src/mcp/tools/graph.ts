@@ -64,7 +64,7 @@ export function registerGraphTools(
     },
     async ({ graph }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const report = await validateGraphCapabilitiesWithGateway(gatewayManager.gateway!, graph as Parameters<typeof validateGraphCapabilitiesWithGateway>[1]);
         return { content: [{ type: "text", text: formatJson(report) }], structuredContent: { ...report }, isError: !report.valid };
       } catch (error) {
@@ -96,7 +96,7 @@ export function registerGraphTools(
     },
     async ({ response_format = "markdown" }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await getGraphs(gatewayManager.gateway!);
 
         if (!result.success) {
@@ -155,7 +155,7 @@ export function registerGraphTools(
     },
     async ({ id, response_format = "markdown" }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await getGraph(gatewayManager.gateway!, id);
 
         if (!result.success) {
@@ -246,7 +246,7 @@ export function registerGraphTools(
     },
     async ({ name, nodes, variables, enable }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await createGraph(gatewayManager.gateway!, { name, nodes, variables, enable });
 
         if (!result.success) {
@@ -367,7 +367,7 @@ export function registerGraphTools(
     async ({ draftId }) => {
       let commitToken: string | undefined;
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const commit = drafts.beginCommit(draftId);
         commitToken = commit.commitToken;
         if (commit.committedGraphId) {
@@ -442,7 +442,7 @@ export function registerGraphTools(
     },
     async ({ id, name, nodes, enable }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await updateGraph(gatewayManager.gateway!, id, { name, nodes, enable });
 
         if (!result.success) {
@@ -488,7 +488,7 @@ export function registerGraphTools(
     },
     async ({ id }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await deleteGraph(gatewayManager.gateway!, id);
 
         if (!result.success) {
@@ -534,7 +534,7 @@ export function registerGraphTools(
     },
     async ({ id, enable }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await toggleGraph(gatewayManager.gateway!, id, enable);
 
         if (!result.success) {

@@ -45,7 +45,7 @@ Args:
     },
     async ({ method, params = {}, timeout = 10000 }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await callGatewayApi(
           gatewayManager.gateway!,
           method,

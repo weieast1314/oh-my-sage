@@ -54,7 +54,7 @@ export function registerVariableTools(
     },
     async ({ scope = "global", response_format = "markdown" }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await getVariables(gatewayManager.gateway!, scope);
 
         if (!result.success) {
@@ -112,7 +112,7 @@ export function registerVariableTools(
     },
     async ({ id, value, scope = "global" }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await setVariable(gatewayManager.gateway!, id, value, scope);
 
         if (!result.success) {
@@ -167,7 +167,7 @@ export function registerVariableTools(
             isError: true,
           };
         }
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await createVariable(gatewayManager.gateway!, id, type, value, name, scope);
 
         if (!result.success) {
@@ -213,7 +213,7 @@ export function registerVariableTools(
     },
     async ({ id, scope = "global" }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await deleteVariable(gatewayManager.gateway!, id, scope);
 
         if (!result.success) {
@@ -259,7 +259,7 @@ export function registerVariableTools(
     },
     async ({ id, scope = "global" }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await getVariableValue(gatewayManager.gateway!, id, scope);
 
         if (!result.success) {
@@ -305,7 +305,7 @@ export function registerVariableTools(
     },
     async ({ id, scope = "global" }) => {
       try {
-        gatewayManager.ensureConnected();
+        await gatewayManager.ensureConnected();
         const result = await getVariableConfig(gatewayManager.gateway!, id, scope);
 
         if (!result.success) {
