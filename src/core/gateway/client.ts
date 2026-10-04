@@ -269,6 +269,21 @@ export class GatewayClient {
     private cipherIn: AESGCMCipher | null = null;
     private secureEstablished = false;
     private connected = false;
+    private keepaliveTimer: NodeJS.Timeout | null = null;
+    private missedPongs = 0;
+    private lastPongAt = 0;
+    private disconnectHandlers: Array<() => void> = [];
+
+    /** 注册断线回调（manager 用它触发自动重连） */
+    onDisconnected(handler: () => void): void {
+        this.disconnectHandlers.push(handler);
+    }
+
+    private emitDisconnected(): void {
+        for (const handler of this.disconnectHandlers.splice(0)) {
+            try { handler(); } catch { /* handler 异常不影响其他回调 */ }
+        }
+    }
 
     private static parseUrl(url: string): string {
         const match = url.match(/^(https?):\/\/([^/:]+)(?::(\d+))?((?:\/.*)?)/);
@@ -312,8 +327,19 @@ export class GatewayClient {
                     this.handshakeFrames.push(data);
                 }
             });
-            ws.on('close', (code) => fail(new Error(`Gateway connection closed (${code})`)));
+            ws.on('close', (code) => {
+                // 已建立过安全会话的连接断开 = 运行期掉线，通知 manager 重连
+                if (this.ws === ws && this.secureEstablished) this.emitDisconnected();
+                fail(new Error(`Gateway connection closed (${code})`));
+            });
             ws.on('error', fail);
+            // pong 响应保活计数（收到任何 pong 即认为链路活着）
+            ws.on('pong', () => {
+                if (this.ws === ws) {
+                    this.missedPongs = 0;
+                    this.lastPongAt = Date.now();
+                }
+            });
 
             ws.on('open', () => {
                 if (this.ws !== ws || this.handshakeError) return;
@@ -349,9 +375,17 @@ export class GatewayClient {
     async authenticate(passcode: string): Promise<void> {
         const jpake = new ECJPAKE(passcode, 'client');
 
+        const describeError = (payload: Buffer): string => {
+            try { return payload.toString('utf8').replace(/\0+$/, '').slice(0, 120) || '(empty)'; }
+            catch { return `(binary ${payload.length}B)`; }
+        };
+
         let response = await this.recv();
+        if (response[0] === DATA_TYPE.ERROR) {
+            throw new Error(`Gateway rejected protocol selection: ${describeError(response.slice(1))}`);
+        }
         if (response[0] !== DATA_TYPE.SELECTED_PROTOCOL) {
-            throw new Error('Protocol selection failed');
+            throw new Error(`Protocol selection failed (got type ${response[0]})`);
         }
 
         const roundOne = jpake.writeRoundOne();
@@ -359,7 +393,8 @@ export class GatewayClient {
 
         response = await this.recv();
         if (response[0] !== DATA_TYPE.ECJPAKE_ROUND_ONE) {
-            throw new Error(`Unexpected response type: ${response[0]}`);
+            const extra = response[0] === DATA_TYPE.ERROR ? `: ${describeError(response.slice(1))}` : '';
+            throw new Error(`Expected JPAKE round one, got type ${response[0]}${extra}`);
         }
         jpake.readRoundOne(response.slice(1));
 
@@ -368,7 +403,8 @@ export class GatewayClient {
 
         response = await this.recv();
         if (response[0] !== DATA_TYPE.ECJPAKE_ROUND_TWO) {
-            throw new Error(`Unexpected response type: ${response[0]}`);
+            const extra = response[0] === DATA_TYPE.ERROR ? `: ${describeError(response.slice(1))}` : '';
+            throw new Error(`Expected JPAKE round two, got type ${response[0]}${extra}`);
         }
         const serverRoundTwo = response.slice(1);
 
@@ -413,6 +449,40 @@ export class GatewayClient {
         ws.on('message', (data: Buffer) => {
             if (this.ws === ws) this.handleMessage(data);
         });
+        this.startKeepalive();
+    }
+
+    /**
+     * WS 协议层保活：每 20s ping 一次；连续 2 次无 pong 判定连接死亡并主动断开，
+     * 让上层（manager）触发自动重连。解决空闲超时导致的半开连接（登录"自动过期"的根因）。
+     */
+    private startKeepalive(): void {
+        this.stopKeepalive();
+        this.lastPongAt = Date.now();
+        this.missedPongs = 0;
+        this.keepaliveTimer = setInterval(() => {
+            const ws = this.ws;
+            if (!ws || !this.secureEstablished) return;
+            // pong 处理在 connect() 中注册；此处只发探测
+            try {
+                ws.ping();
+                this.missedPongs += 1;
+                if (this.missedPongs >= 2) {
+                    // 连续两次探测无响应：连接已死（NAT 超时/网关重启），强制关闭触发重连
+                    ws.terminate();
+                }
+            } catch {
+                // ping 抛错说明底层已坏
+                ws.terminate();
+            }
+        }, 20000);
+    }
+
+    private stopKeepalive(): void {
+        if (this.keepaliveTimer !== null) {
+            clearInterval(this.keepaliveTimer);
+            this.keepaliveTimer = null;
+        }
     }
 
     private handleMessage(data: Buffer): void {
@@ -481,6 +551,7 @@ export class GatewayClient {
     }
 
     async close(): Promise<void> {
+        this.stopKeepalive();
         this.connected = false;
         this.secureEstablished = false;
         this.cipherIn = null;
@@ -490,6 +561,12 @@ export class GatewayClient {
         for (const waiter of this.handshakeWaiters.splice(0)) {
             clearTimeout(waiter.timer);
             waiter.reject(this.handshakeError);
+        }
+        // 拒绝所有挂起的 API 请求，避免上层拿到永不 settle 的 Promise（僵尸请求）
+        const pending = [...this.pendingRequests.values()];
+        this.pendingRequests.clear();
+        for (const future of pending) {
+            future.reject(new Error('Gateway connection closed'));
         }
         if (this.ws) {
             this.ws.close();
